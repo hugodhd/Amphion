@@ -1,6 +1,5 @@
 import math
 import json
-import librosa
 import torch
 import torchaudio
 import accelerate
@@ -14,8 +13,26 @@ import torchvision
 import random
 import numpy as np
 import whisper
-from librosa.feature import chroma_stft
-from librosa.effects import pitch_shift
+
+# Lazy-import librosa to avoid numba JIT crash on Windows
+_librosa = None
+chroma_stft = None
+pitch_shift = None
+
+def _ensure_librosa():
+    global _librosa
+    if _librosa is None:
+        import librosa as _lib
+        _librosa = _lib
+
+def _ensure_librosa_features():
+    global chroma_stft, pitch_shift
+    _ensure_librosa()
+    if chroma_stft is None:
+        from librosa.feature import chroma_stft as _cs
+        from librosa.effects import pitch_shift as _ps
+        chroma_stft = _cs
+        pitch_shift = _ps
 
 from models.codec.coco.rep_coco_model import CocoContentStyle, CocoContent, CocoStyle
 from models.svc.flow_matching_transformer.fmt_model import FlowMatchingTransformer
@@ -141,7 +158,8 @@ def load_wav(wav_path, device, used_duration=None):
         speech_tensor = torch.zeros(1, 0).to(device)  # [1, T]
         speech16k = torch.zeros(1, 0).to(device)  # [1, T']
     else:
-        speech = librosa.load(wav_path, sr=24000)[0]  # [T]
+        _ensure_librosa()
+        speech = _librosa.load(wav_path, sr=24000)[0]  # [T]
 
         if used_duration is not None:
             speech = speech[: int(used_duration * 24000)]
@@ -412,6 +430,7 @@ class Vevo2InferencePipeline:
         frame_len = len(wav24k_numpy) // self.fmt_cfg.preprocess.hop_size
 
         if use_shifted_wav_to_extract_chromagram:
+            _ensure_librosa_features()
             chromagram_feats = self.get_chromagram(
                 pitch_shift(wav24k_numpy, sr=24000, n_steps=pitch_shift_steps),
                 frame_len,
@@ -444,6 +463,7 @@ class Vevo2InferencePipeline:
             )
 
         if use_shifted_wav_to_extract_whisper:
+            _ensure_librosa_features()
             wav16k = pitch_shift(
                 wav16k.cpu().numpy()[0], sr=16000, n_steps=pitch_shift_steps
             )  # [T]
@@ -470,6 +490,7 @@ class Vevo2InferencePipeline:
         return codecs
 
     def get_chromagram(self, speech, speech_frames):
+        _ensure_librosa_features()
         # [24, T] -> [T, 24]
         chromagram = chroma_stft(
             y=speech,
