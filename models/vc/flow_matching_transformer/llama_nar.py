@@ -82,7 +82,7 @@ class OldLlamaAttention(nn.Module):
         self.num_key_value_heads = config.num_key_value_heads
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.max_position_embeddings = config.max_position_embeddings
-        self.rope_theta = config.rope_theta
+        self.rope_theta = getattr(config, "rope_theta", 10000.0)
         self.is_causal = True
 
         self.q_proj = nn.Linear(
@@ -323,7 +323,7 @@ class DiffLlama(LlamaModel):
         dropout=0.1,
         ffn_dropout=0.1,
         attention_dropout=0.0,
-        config=LlamaConfig(0, 256, 1024, 1, 1),
+        config=LlamaConfig(vocab_size=0, hidden_size=256, intermediate_size=1024, num_hidden_layers=1, num_attention_heads=1),
     ):
         super().__init__(config)
 

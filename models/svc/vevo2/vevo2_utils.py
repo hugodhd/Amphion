@@ -745,13 +745,17 @@ class Vevo2InferencePipeline:
             timbre_ref_speech16k,
             timbre_ref_speech,
         )  # [1, T]
+        # Free WAV tensors as soon as codecs are extracted; keep speech24k for mel.
+        del timbre_ref_speech, timbre_ref_speech16k
 
         diffusion_input_codecs = torch.cat(
             [timbre_ref_codecs, contentstyle_codecs], dim=1
         )
+        del timbre_ref_codecs  # merged into diffusion_input_codecs
 
         # Prepare the condition for diffusion
         diffusion_cond = self.fmt_model.cond_emb(diffusion_input_codecs)  # [1, T, D]
+        del diffusion_input_codecs  # embedded into diffusion_cond
         if self.fmt_model.do_resampling:
             # Align to the frame rate of Mels
             diffusion_cond = self.fmt_model.resampling_layers(
@@ -759,6 +763,7 @@ class Vevo2InferencePipeline:
             ).transpose(1, 2)
 
         timbre_ref_mels = self.extract_mel_feature(timbre_ref_speech24k)  # [1, T, D]
+        del timbre_ref_speech24k  # consumed by mel extraction
 
         # Text as condition
         if self.fmt_use_text_as_condition:
@@ -782,6 +787,7 @@ class Vevo2InferencePipeline:
             text_embedding=prefix_text_embedding,
             n_timesteps=flow_matching_steps,
         )
+        del diffusion_cond, timbre_ref_mels  # consumed by diffusion
         return predict_mel_feat
 
     @torch.no_grad()
@@ -820,6 +826,7 @@ class Vevo2InferencePipeline:
         used_duration_of_timbre_ref_wav_path=None,
         flow_matching_steps=32,
         display_audio=False,
+        max_new_tokens=500,
     ):
         """
         Based on the style reference wav to conduct the continuation generation:
@@ -886,7 +893,7 @@ class Vevo2InferencePipeline:
 
         if self.use_vllm:
             sampling_params = SamplingParams(
-                max_tokens=500,
+                max_tokens=max_new_tokens,
                 top_k=top_k,
                 top_p=top_p,
                 temperature=temperature,
@@ -913,7 +920,7 @@ class Vevo2InferencePipeline:
             generate_ids = self.ar_model.generate(
                 input_ids=llm_input_ids,
                 min_new_tokens=15,
-                max_new_tokens=500,
+                max_new_tokens=max_new_tokens,
                 eos_token_id=self.ar_tokenizer.eos_token_id,
                 do_sample=True,
                 top_k=top_k,
@@ -924,6 +931,10 @@ class Vevo2InferencePipeline:
             predicted_coco_codecs = self.parse_llm_generated_ids(
                 generate_ids, llm_input_ids, logging=display_audio
             )  # [1, T]
+            # Free AR tensors immediately — they are no longer needed and
+            # holding them during the diffusion stage wastes VRAM and
+            # prevents the CUDA allocator from reusing those blocks.
+            del generate_ids, llm_input_ids
 
         ## Diffusion ##
         predict_mel_feat = self.code2mel(
@@ -933,11 +944,13 @@ class Vevo2InferencePipeline:
             flow_matching_steps=flow_matching_steps,
             logging=display_audio,
         )  # [1, T, D]
+        del predicted_coco_codecs  # consumed by code2mel
 
         ## Vocoder ##
         synthesized_audio = self.mel2audio(
             predict_mel_feat, logging=display_audio
         )  # [1, T]
+        del predict_mel_feat  # consumed by vocoder; audio is now on CPU
         return synthesized_audio
 
     @torch.no_grad()
