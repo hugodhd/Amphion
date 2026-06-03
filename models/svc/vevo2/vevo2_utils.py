@@ -1,5 +1,6 @@
 import math
 import json
+import time
 import librosa
 import torch
 import torchaudio
@@ -22,7 +23,7 @@ from models.svc.flow_matching_transformer.fmt_model import FlowMatchingTransform
 from models.codec.melvqgan.melspec import MelSpectrogram
 from models.codec.amphion_codec.vocos import Vocos
 
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
 
 from utils.util import load_config
 from models.svc.vevo2.qwen_utils import gen_chat_prompt
@@ -30,17 +31,16 @@ from evaluation.metrics.f0.f0_corr import extract_f0_hz
 
 from transformers.utils import is_flash_attn_2_available
 
-supported_flash_attn = False
-if not torch.cuda.is_available():
-    print("No CUDA available")
-    supported_flash_attn = False
-
-# To check if flash attention is supported
-if is_flash_attn_2_available():
-    supported_flash_attn = True
-    print("Flash Attention is supported")
+# PyTorch built-in SDPA flash (used by attn_implementation="sdpa")
+_have_sdpa_flash = torch.cuda.is_available() and torch.backends.cuda.flash_sdp_enabled()
+# Standalone flash-attn package (not needed — SDPA subsumes it on Ampere+)
+_supported_flash_attn_pkg = is_flash_attn_2_available()
+if _have_sdpa_flash:
+    print("[Vevo2] PyTorch SDPA flash attention available (using sdpa backend)")
+elif _supported_flash_attn_pkg:
+    print("[Vevo2] flash-attn package available")
 else:
-    print("Flash Attention is not supported")
+    print("[Vevo2] PyTorch SDPA available (math/mem-efficient backends)")
 
 
 # Coco Tokenizer
@@ -76,22 +76,153 @@ def build_fmt_model(cfg, device):
 
 # Autoregressive Transformer
 def build_ar_model(ckpt_path, device):
-    model_kwargs = {
-        "device_map": device,
-        "torch_dtype": "auto",
-        "trust_remote_code": True,
-    }
+    """Load AR model on CPU first, then move explicitly to GPU.
 
-    # Only add flash attention parameter if supported
-    if supported_flash_attn:
-        model_kwargs["attn_implementation"] = "flash_attention_2"
+    NOTE: device_map is NOT used because HuggingFace's handling of
+    device_map with specific devices is unreliable (model silently loads
+    on CPU).  We use explicit .to(device) + float16 for guaranteed GPU
+    placement and 2x throughput vs float32.
+    """
+    # ── Load config, force SDPA, then instantiate model ────────────────
+    _cfg = AutoConfig.from_pretrained(ckpt_path, trust_remote_code=True)
+    _cfg._attn_implementation = "sdpa"
+    _cfg._attn_implementation_internal = "sdpa"
 
-    # model = AutoModelForCausalLM.from_pretrained(
-    #     cfg.model.pretrained_model_path, **model_kwargs
-    # )
-    model = AutoModelForCausalLM.from_pretrained(ckpt_path, **model_kwargs)
-
+    _t0 = time.perf_counter()
+    model = AutoModelForCausalLM.from_pretrained(
+        ckpt_path,
+        config=_cfg,
+        dtype=torch.float16,
+        trust_remote_code=True,
+        attn_implementation="sdpa",
+    )
+    model = model.to(device)
     model.eval()
+    _load_s = time.perf_counter() - _t0
+
+    _dev = next(model.parameters()).device
+    _dtype = next(model.parameters()).dtype
+    _nparams = sum(p.numel() for p in model.parameters()) / 1e6
+    print(f"[Vevo2] AR model loaded: device={_dev} dtype={_dtype} "
+          f"params={_nparams:.0f}M load_time={_load_s:.1f}s")
+
+    # Verify all params on same device (catches accidental CPU holdouts)
+    _devices = {p.device for p in model.parameters()}
+    if len(_devices) > 1:
+        print(f"[WARN] AR model parameters on multiple devices: {_devices}")
+    else:
+        _actual_dev = list(_devices)[0]
+        if _actual_dev.type != device.type or _actual_dev.index != getattr(device, 'index', None):
+            print(f"[WARN] AR model is on {_actual_dev}, expected {device}")
+
+    # torch.compile with Triton was tested and REVERTED because:
+    # - DynamicCache recompilations (cache state changes every step) negated any benefit
+    # - Triton kernels for small matrix dims (896×4864) are slower than cuBLAS in eager
+    # - Eager cuBLAS is faster on this Windows + RTX 3090 setup for this model size
+
+    # Quick sanity: benchmark forward passes (with warmup)
+    _test_input = torch.randint(0, 100, (1, 16), device=device)
+    with torch.no_grad():
+        # Warmup
+        for _ in range(3):
+            _ = model(_test_input)
+        torch.cuda.synchronize()
+        # Timed: 5 passes of 16 tokens
+        _t0 = time.perf_counter()
+        for _ in range(5):
+            _ = model(_test_input)
+        torch.cuda.synchronize()
+        _fw_16 = (time.perf_counter() - _t0) / 5.0
+
+        # Timed: 5 passes of 1 token (simulates decode with cache)
+        _t1tok = torch.randint(0, 100, (1, 1), device=device)
+        _out = model(_test_input, use_cache=True)
+        _past = _out.past_key_values
+        torch.cuda.synchronize()
+        # Warmup decode path
+        for _ in range(3):
+            _out = model(_t1tok, past_key_values=_past, use_cache=True)
+            _past = _out.past_key_values
+        torch.cuda.synchronize()
+        _t0 = time.perf_counter()
+        for _ in range(10):
+            _out = model(_t1tok, past_key_values=_past, use_cache=True)
+            _past = _out.past_key_values
+        torch.cuda.synchronize()
+        _fw_1 = (time.perf_counter() - _t0) / 10.0
+
+    # Micro-profile: time just the LM head with warmup
+    _hidden = torch.randn(1, 1, model.config.hidden_size, device=device, dtype=torch.float16)
+    for _ in range(10):
+        _ = model.lm_head(_hidden)
+    torch.cuda.synchronize()
+    _t0 = time.perf_counter()
+    for _ in range(20):
+        _ = model.lm_head(_hidden)
+    torch.cuda.synchronize()
+    _lm_ms = (time.perf_counter() - _t0) / 20.0 * 1000
+
+    # Micro-profile: time attention component of a layer
+    _layer = model.model.layers[0]
+    _pos = model.model.rotary_emb(_hidden, torch.zeros(1, 1, dtype=torch.long, device=device))
+    for _ in range(10):
+        _ = _layer.self_attn(_hidden, position_embeddings=_pos, attention_mask=None, past_key_values=None)
+    torch.cuda.synchronize()
+    _t0 = time.perf_counter()
+    for _ in range(50):
+        _ = _layer.self_attn(_hidden, position_embeddings=_pos, attention_mask=None, past_key_values=None)
+    torch.cuda.synchronize()
+    _attn_ms = (time.perf_counter() - _t0) / 50.0 * 1000
+
+    # Micro-profile: time MLP component of a layer
+    _hidden_attn = _hidden.clone()
+    for _ in range(10):
+        _ = _layer.mlp(_hidden_attn)
+    torch.cuda.synchronize()
+    _t0 = time.perf_counter()
+    for _ in range(50):
+        _ = _layer.mlp(_hidden_attn)
+    torch.cuda.synchronize()
+    _mlp_ms = (time.perf_counter() - _t0) / 50.0 * 1000
+
+    # Micro-profile: time rotary embedding
+    for _ in range(10):
+        _ = model.model.rotary_emb(_hidden, torch.zeros(1, 1, dtype=torch.long, device=device))
+    torch.cuda.synchronize()
+    _t0 = time.perf_counter()
+    for _ in range(50):
+        _ = model.model.rotary_emb(_hidden, torch.zeros(1, 1, dtype=torch.long, device=device))
+    torch.cuda.synchronize()
+    _rope_ms = (time.perf_counter() - _t0) / 50.0 * 1000
+
+    # Micro-profile: time input_layernorm alone
+    _rms = _layer.input_layernorm
+    for _ in range(10):
+        _ = _rms(_hidden)
+    torch.cuda.synchronize()
+    _t0 = time.perf_counter()
+    for _ in range(50):
+        _ = _rms(_hidden)
+    torch.cuda.synchronize()
+    _rms_ms = (time.perf_counter() - _t0) / 50.0 * 1000
+
+    _attn_cls = type(model.model.layers[0].self_attn).__name__
+    _attn_impl = getattr(model.config, '_attn_implementation', '?')
+    _use_cache = model.config.use_cache
+    _layer_sum = _rms_ms + _attn_ms + _mlp_ms
+    print(f"[Vevo2] AR model: fwd16={_fw_16*1000:.0f}ms fwd1_dec={_fw_1*1000:.1f}ms "
+          f"use_cache={_use_cache} attn={_attn_cls} impl={_attn_impl} "
+          f"vocab={model.config.vocab_size}")
+    print(f"[Vevo2] AR micro: lm_head={_lm_ms:.1f}ms rope={_rope_ms:.2f}ms "
+          f"rms={_rms_ms:.3f}ms attn={_attn_ms:.3f}ms mlp={_mlp_ms:.3f}ms "
+          f"layer_sum={_layer_sum:.3f}ms "
+          f"est_fwd1={_lm_ms + _rope_ms + _layer_sum * model.config.num_hidden_layers:.0f}ms "
+          f"(lm+rope+24*(rms+attn+mlp))")
+
+    _total_on_cuda = sum(1 for p in model.parameters() if p.device.type == 'cuda')
+    _total = sum(1 for p in model.parameters())
+    print(f"[Vevo2] AR model: {_total_on_cuda}/{_total} params on CUDA")
+
     return model
 
 
@@ -662,13 +793,24 @@ class Vevo2InferencePipeline:
         style_ref_wav_path=None,
         use_pitch_shift=False,
         pitch_shift_steps=0,
+        used_duration=None,
         logging=False,
     ):
         if style_ref_wav_path is None:
             return "<|content_style_start|>"
 
+        # Cache the encoded prompt string — same wav path + pitch params + duration
+        # always produces the same token sequence.  Avoids disk I/O + DualCodec
+        # forward pass on every synthesis call when the style ref is fixed.
+        _dur_key = round(used_duration, 2) if used_duration is not None else None
+        _cache_key = (style_ref_wav_path, bool(use_pitch_shift), int(pitch_shift_steps), _dur_key)
+        if not hasattr(self, "_contentstyle_prompt_cache"):
+            self._contentstyle_prompt_cache = {}
+        if _cache_key in self._contentstyle_prompt_cache:
+            return self._contentstyle_prompt_cache[_cache_key]
+
         style_ref_speech, style_ref_speech24k, style_ref_speech16k = load_wav(
-            style_ref_wav_path, self.device
+            style_ref_wav_path, self.device, used_duration=used_duration
         )
         if logging:
             print("-" * 20)
@@ -688,6 +830,7 @@ class Vevo2InferencePipeline:
             ["<|content_style_{}|>".format(i) for i in prompt_output_ids]
         )
         prompt_output_text = "<|content_style_start|>" + prompt_output_text
+        self._contentstyle_prompt_cache[_cache_key] = prompt_output_text
         return prompt_output_text
 
     def parse_llm_generated_ids(self, generated_ids, llm_input_ids, logging=False):
@@ -730,28 +873,43 @@ class Vevo2InferencePipeline:
         flow_matching_steps=32,
         logging=False,
     ):
-        timbre_ref_speech, timbre_ref_speech24k, timbre_ref_speech16k = load_wav(
-            timbre_ref_wav_path,
-            self.device,
-            used_duration=used_duration_of_timbre_ref_wav_path,
-        )
+        # Cache timbre-ref codecs + mels — same wav + duration always produces
+        # the same tensors.  Avoids loading 10 s of reference audio + DualCodec
+        # encode + mel extraction on every synthesis call.
+        _timbre_cache_key = (timbre_ref_wav_path, used_duration_of_timbre_ref_wav_path)
+        if not hasattr(self, "_timbre_ref_cache"):
+            self._timbre_ref_cache = {}
+        if _timbre_cache_key in self._timbre_ref_cache:
+            timbre_ref_codecs, timbre_ref_mels = self._timbre_ref_cache[_timbre_cache_key]
+        else:
+            timbre_ref_speech, timbre_ref_speech24k, timbre_ref_speech16k = load_wav(
+                timbre_ref_wav_path,
+                self.device,
+                used_duration=used_duration_of_timbre_ref_wav_path,
+            )
+            if logging:
+                print("-" * 20)
+                print("Timbre Reference Audio: ", timbre_ref_wav_path)
+                display_audio_in_notebook(timbre_ref_speech, rate=24000)
+
+            timbre_ref_codecs = self.extract_coco_codec(
+                "content_style",
+                timbre_ref_speech16k,
+                timbre_ref_speech,
+            )  # [1, T]
+            del timbre_ref_speech, timbre_ref_speech16k
+            timbre_ref_mels = self.extract_mel_feature(timbre_ref_speech24k)  # [1, T, D]
+            del timbre_ref_speech24k
+            self._timbre_ref_cache[_timbre_cache_key] = (timbre_ref_codecs, timbre_ref_mels)
+
         if logging:
             print("-" * 20)
-            print("Timbre Reference Audio: ", timbre_ref_wav_path)
-            display_audio_in_notebook(timbre_ref_speech, rate=24000)
-
-        timbre_ref_codecs = self.extract_coco_codec(
-            "content_style",
-            timbre_ref_speech16k,
-            timbre_ref_speech,
-        )  # [1, T]
-        # Free WAV tensors as soon as codecs are extracted; keep speech24k for mel.
-        del timbre_ref_speech, timbre_ref_speech16k
+            print("Timbre Reference Audio: ", timbre_ref_wav_path, "(cached)")
 
         diffusion_input_codecs = torch.cat(
             [timbre_ref_codecs, contentstyle_codecs], dim=1
         )
-        del timbre_ref_codecs  # merged into diffusion_input_codecs
+        # Note: do NOT del timbre_ref_codecs — it is held in _timbre_ref_cache.
 
         # Prepare the condition for diffusion
         diffusion_cond = self.fmt_model.cond_emb(diffusion_input_codecs)  # [1, T, D]
@@ -761,9 +919,6 @@ class Vevo2InferencePipeline:
             diffusion_cond = self.fmt_model.resampling_layers(
                 diffusion_cond.transpose(1, 2)
             ).transpose(1, 2)
-
-        timbre_ref_mels = self.extract_mel_feature(timbre_ref_speech24k)  # [1, T, D]
-        del timbre_ref_speech24k  # consumed by mel extraction
 
         # Text as condition
         if self.fmt_use_text_as_condition:
@@ -824,9 +979,11 @@ class Vevo2InferencePipeline:
         style_ref_wav_shifted_steps=0,
         target_duration=None,
         used_duration_of_timbre_ref_wav_path=None,
+        used_duration_of_style_ref_wav_path=None,
         flow_matching_steps=32,
         display_audio=False,
         max_new_tokens=500,
+        return_metrics=False,
     ):
         """
         Based on the style reference wav to conduct the continuation generation:
@@ -837,7 +994,32 @@ class Vevo2InferencePipeline:
         # assert style_ref_wav_path is not None
         assert timbre_ref_wav_path is not None
 
+        def _sync_cuda_if_needed():
+            if not return_metrics:
+                return
+            try:
+                device_type = getattr(self.device, "type", str(self.device))
+                if torch.cuda.is_available() and str(device_type).startswith("cuda"):
+                    torch.cuda.synchronize()
+            except Exception:
+                pass
+
+        def _stage_start():
+            if not return_metrics:
+                return None
+            _sync_cuda_if_needed()
+            return time.perf_counter()
+
+        def _stage_end(start_time):
+            if not return_metrics or start_time is None:
+                return 0.0
+            _sync_cuda_if_needed()
+            return time.perf_counter() - start_time
+
+        total_t0 = _stage_start()
+
         ## Text Tokens ##
+        prompt_t0 = _stage_start()
         if display_audio:
             print("-" * 20)
             print("Target text: \n", target_text)
@@ -881,6 +1063,7 @@ class Vevo2InferencePipeline:
             style_ref_wav_path,
             use_pitch_shift=use_pitch_shift,
             pitch_shift_steps=style_ref_wav_shifted_steps,
+            used_duration=used_duration_of_style_ref_wav_path,
             logging=display_audio,
         )
 
@@ -890,8 +1073,11 @@ class Vevo2InferencePipeline:
         llm_input_ids = (
             torch.tensor(llm_input_ids, dtype=torch.long).to(self.device).unsqueeze(0)
         )  # [1, T]
+        llm_input_tokens = int(llm_input_ids.shape[1])
+        prompt_time_s = _stage_end(prompt_t0)
 
         if self.use_vllm:
+            ar_t0 = _stage_start()
             sampling_params = SamplingParams(
                 max_tokens=max_new_tokens,
                 top_k=top_k,
@@ -916,7 +1102,9 @@ class Vevo2InferencePipeline:
                 .to(self.device)
                 .unsqueeze(0)
             )  # [1, T]
+            ar_time_s = _stage_end(ar_t0)
         else:
+            ar_t0 = _stage_start()
             generate_ids = self.ar_model.generate(
                 input_ids=llm_input_ids,
                 min_new_tokens=15,
@@ -931,12 +1119,16 @@ class Vevo2InferencePipeline:
             predicted_coco_codecs = self.parse_llm_generated_ids(
                 generate_ids, llm_input_ids, logging=display_audio
             )  # [1, T]
+            ar_time_s = _stage_end(ar_t0)
             # Free AR tensors immediately — they are no longer needed and
             # holding them during the diffusion stage wastes VRAM and
             # prevents the CUDA allocator from reusing those blocks.
             del generate_ids, llm_input_ids
 
+        generated_contentstyle_tokens = int(predicted_coco_codecs.shape[1])
+
         ## Diffusion ##
+        fm_t0 = _stage_start()
         predict_mel_feat = self.code2mel(
             predicted_coco_codecs,
             timbre_ref_wav_path,
@@ -944,13 +1136,34 @@ class Vevo2InferencePipeline:
             flow_matching_steps=flow_matching_steps,
             logging=display_audio,
         )  # [1, T, D]
+        fm_time_s = _stage_end(fm_t0)
         del predicted_coco_codecs  # consumed by code2mel
 
         ## Vocoder ##
+        vocoder_t0 = _stage_start()
         synthesized_audio = self.mel2audio(
             predict_mel_feat, logging=display_audio
         )  # [1, T]
+        vocoder_time_s = _stage_end(vocoder_t0)
         del predict_mel_feat  # consumed by vocoder; audio is now on CPU
+
+        if return_metrics:
+            total_time_s = _stage_end(total_t0)
+            metrics = {
+                "prompt_s": prompt_time_s,
+                "ar_s": ar_time_s,
+                "fm_s": fm_time_s,
+                "vocoder_s": vocoder_time_s,
+                "total_s": total_time_s,
+                "target_text_words": len(target_text.split()),
+                "style_text_words": len(style_ref_wav_text.split()) if style_ref_wav_text else 0,
+                "llm_input_tokens": llm_input_tokens,
+                "generated_contentstyle_tokens": generated_contentstyle_tokens,
+                "max_new_tokens": int(max_new_tokens),
+                "flow_matching_steps": int(flow_matching_steps),
+            }
+            return synthesized_audio, metrics
+
         return synthesized_audio
 
     @torch.no_grad()
